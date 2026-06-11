@@ -1,0 +1,61 @@
+# Rust / cargo workspace
+target/
+**/target/
+*.rs.bk
+# (Cargo.lock is committed at workspace root — binary crate, G10 reproducibility)
+
+# Python (legacy-python-stub/)
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*~
+
+# OS
+.DS_Store
+
+# Project artifacts (keep dir, ignore content)
+te_looker/cache/*
+!te_looker/cache/.gitkeep
+
+baseline/*.log
+baseline/*.tmpdir/
+baseline/runs/
+
+# Big input files
+*.fa
+*.fasta
+*.fa.gz
+*.bam
+*.bai
+*.hmm
+*.h3?
+*.gff
+*.gff3
+*.bed
+*.tsv
+*.parquet
+
+# Allow tiny test fixtures
+!tests/**/*.fa
+!tests/**/*.bed

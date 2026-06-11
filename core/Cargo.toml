@@ -1,0 +1,19 @@
+[package]
+name = "te-core"
+version = "0.3.0"
+edition = "2021"
+description = "de novo repeat detection — performance core (Rust). P1 io+index+seed, P2 A1 extend-to-consensus, P2b spoa refine, P3 rayon parallel + minimizer scaling."
+
+[lib]
+name = "te_core"
+path = "src/lib.rs"
+
+[dependencies]
+rayon = "1"
+
+# binaries auto-detected from src/bin/*.rs : te-seed, te-discover, te-refine
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
