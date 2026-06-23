@@ -46,9 +46,12 @@ pub fn read_fasta(path: &str) -> Vec<Record> {
     let mut recs: Vec<Record> = Vec::new();
     let mut name = String::new();
     let mut codes: Vec<u8> = Vec::new();
-    let mut push = |name: &mut String, codes: &mut Vec<u8>, recs: &mut Vec<Record>| {
+    let push = |name: &mut String, codes: &mut Vec<u8>, recs: &mut Vec<Record>| {
         if !name.is_empty() {
-            recs.push(Record { name: std::mem::take(name), codes: std::mem::take(codes) });
+            recs.push(Record {
+                name: std::mem::take(name),
+                codes: std::mem::take(codes),
+            });
         }
     };
     for line in BufReader::new(f).lines() {
@@ -84,73 +87,141 @@ pub struct HarvestStats {
     pub max_count: u64,
 }
 
-/// Scan one record -> packed (canon:u32<<32 | gpos:u32) entries.
-/// w==1: every canonical k-mer (exact, reproduces jellyfish). w>1: (w,k)-minimizers only
-/// (1/w density via a monotonic deque) — the memory/throughput lever for multi-Gb genomes.
-fn scan_record(rec: &Record, ri: usize, k: u32, w: u32, mask: u32, hi: u32) -> Vec<u64> {
-    let mut out: Vec<u64> = Vec::new();
+/// Scan one record -> packed u128 (canon:32 [bits 64..95] | strand:1 | ri:31 | off:32)
+/// entries. The low 64 bits hold the full occurrence payload so multi-Gb genomes with
+/// >64 records or >33.5 Mb chromosomes no longer overflow (the old u64 layout reserved
+/// > only 6 bits for ri and 25 for off). Sorting by the full u128 groups by canon (the most
+/// > significant non-zero field) exactly as before.
+/// > w==1: every canonical k-mer (exact, reproduces jellyfish). w>1: (w,k)-minimizers only
+/// > (1/w density via a monotonic deque) — the memory/throughput lever for multi-Gb genomes.
+fn scan_record(rec: &Record, ri: usize, k: u32, w: u32, mask: u32, hi: u32) -> Vec<u128> {
+    let mut out: Vec<u128> = Vec::new();
     let (mut fwd, mut rc, mut valid) = (0u32, 0u32, 0u32);
     // deque of (window_pos, hash, packed) for minimizer mode
-    let mut dq: std::collections::VecDeque<(u64, u64, u64)> = std::collections::VecDeque::new();
-    let mut wpos: u64 = 0;          // index among valid k-mers since last reset
+    let mut dq: std::collections::VecDeque<(u64, u64, u128)> = std::collections::VecDeque::new();
+    let mut wpos: u64 = 0; // index among valid k-mers since last reset
     let mut last_emit: u64 = u64::MAX;
     for (i, &b) in rec.codes.iter().enumerate() {
-        if b == 255 { valid = 0; fwd = 0; rc = 0; dq.clear(); wpos = 0; last_emit = u64::MAX; continue; }
+        if b == 255 {
+            valid = 0;
+            fwd = 0;
+            rc = 0;
+            dq.clear();
+            wpos = 0;
+            last_emit = u64::MAX;
+            continue;
+        }
         fwd = ((fwd << 2) | b as u32) & mask;
         rc = (rc >> 2) | (((3 - b) as u32) << hi);
         valid += 1;
-        if valid < k { continue; }
+        if valid < k {
+            continue;
+        }
         let canon = fwd.min(rc);
-        let strand = (fwd <= rc) as u32;
+        let strand = (fwd <= rc) as u64;
         let off = (i + 1 - k as usize) as u32;
-        let packed = ((canon as u64) << 32) | ((strand << 31) | ((ri as u32) << 25) | (off & 0x1FF_FFFF)) as u64;
-        if w <= 1 { out.push(packed); continue; }
+        // low 64 bits = strand:1 (bit 63) | ri:31 (bits 32..62) | off:32 (bits 0..31)
+        let payload: u64 = (strand << 63) | ((ri as u64) << 32) | (off as u64);
+        let packed: u128 = ((canon as u128) << 64) | (payload as u128);
+        if w <= 1 {
+            out.push(packed);
+            continue;
+        }
         let h = mix64(canon as u64);
-        while matches!(dq.back(), Some(&(_, bh, _)) if bh >= h) { dq.pop_back(); }
+        while matches!(dq.back(), Some(&(_, bh, _)) if bh >= h) {
+            dq.pop_back();
+        }
         dq.push_back((wpos, h, packed));
-        while matches!(dq.front(), Some(&(p, _, _)) if p + w as u64 <= wpos + 1) { dq.pop_front(); }
+        while matches!(dq.front(), Some(&(p, _, _)) if p + w as u64 <= wpos + 1) {
+            dq.pop_front();
+        }
         if wpos + 1 >= w as u64 {
             let (mp, _, mpacked) = *dq.front().unwrap();
-            if mp != last_emit { out.push(mpacked); last_emit = mp; }
+            if mp != last_emit {
+                out.push(mpacked);
+                last_emit = mp;
+            }
         }
         wpos += 1;
     }
     out
 }
 
-pub fn harvest(recs: &[Record], k: u32, w: u32, min_count: u64, cap: usize) -> (Vec<Seed>, HarvestStats) {
+pub fn harvest(
+    recs: &[Record],
+    k: u32,
+    w: u32,
+    min_count: u64,
+    cap: usize,
+) -> (Vec<Seed>, HarvestStats) {
     use rayon::prelude::*;
-    assert!(k >= 1 && k <= 16, "build supports 1<=k<=16");
-    let mask: u32 = if k == 16 { u32::MAX } else { (1u32 << (2 * k)) - 1 };
+    assert!((1..=16).contains(&k), "build supports 1<=k<=16");
+    let mask: u32 = if k == 16 {
+        u32::MAX
+    } else {
+        (1u32 << (2 * k)) - 1
+    };
     let hi = 2 * (k - 1);
     // parallel per-record scan, then concatenate (O(N)) and parallel sort
-    let chunks: Vec<Vec<u64>> = recs.par_iter().enumerate()
+    let chunks: Vec<Vec<u128>> = recs
+        .par_iter()
+        .enumerate()
         .map(|(ri, rec)| scan_record(rec, ri, k, w, mask, hi))
         .collect();
-    let mut packed: Vec<u64> = chunks.concat();
+    let mut packed: Vec<u128> = chunks.concat();
     let total = packed.len() as u64;
     packed.par_sort_unstable();
 
     let mut seeds = Vec::new();
-    let mut st = HarvestStats { total, distinct: 0, unique: 0, count2: 0, r_ge3: 0, max_count: 0 };
+    let mut st = HarvestStats {
+        total,
+        distinct: 0,
+        unique: 0,
+        count2: 0,
+        r_ge3: 0,
+        max_count: 0,
+    };
     let n = packed.len();
     let mut i = 0;
     while i < n {
-        let canon = (packed[i] >> 32) as u32;
+        let canon = (packed[i] >> 64) as u32;
         let mut j = i + 1;
-        while j < n && (packed[j] >> 32) as u32 == canon { j += 1; }
+        while j < n && (packed[j] >> 64) as u32 == canon {
+            j += 1;
+        }
         let count = (j - i) as u64;
         st.distinct += 1;
-        match count { 1 => st.unique += 1, 2 => st.count2 += 1, _ => st.r_ge3 += 1 }
-        if count > st.max_count { st.max_count = count; }
+        match count {
+            1 => st.unique += 1,
+            2 => st.count2 += 1,
+            _ => st.r_ge3 += 1,
+        }
+        if count > st.max_count {
+            st.max_count = count;
+        }
         if count >= min_count {
-            let mut g: Vec<u32> = packed[i..j].iter().map(|&p| p as u32).collect();
-            if cap > 0 && g.len() > cap {   // cap==0 => full occurrence list (te-discover masks all copies)
-                g.sort_unstable_by_key(|&x| mix64(x as u64));
+            // low 64 bits = full occurrence payload (strand:1 | ri:31 | off:32)
+            let mut g: Vec<u64> = packed[i..j].iter().map(|&p| p as u64).collect();
+            if cap > 0 && g.len() > cap {
+                // cap==0 => full occurrence list (te-discover masks all copies)
+                g.sort_unstable_by_key(|&x| mix64(x));
                 g.truncate(cap);
             }
-            let occ = g.iter().map(|&x| ((x >> 25) & 0x3F, x & 0x1FF_FFFF, (x >> 31) & 1 == 1)).collect();
-            seeds.push(Seed { code: canon, count, occ });
+            let occ = g
+                .iter()
+                .map(|&x| {
+                    (
+                        ((x >> 32) & 0x7FFF_FFFF) as u32,
+                        (x & 0xFFFF_FFFF) as u32,
+                        (x >> 63) & 1 == 1,
+                    )
+                })
+                .collect();
+            seeds.push(Seed {
+                code: canon,
+                count,
+                occ,
+            });
         }
         i = j;
     }

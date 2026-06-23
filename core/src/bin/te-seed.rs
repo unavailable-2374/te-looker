@@ -2,8 +2,8 @@
 //! Validates the index by reproducing jellyfish's canonical k-mer statistics.
 
 use std::env;
-use std::io::{BufWriter, Write};
 use std::fs::File;
+use std::io::{BufWriter, Write};
 use te_core::{decode, harvest, read_fasta};
 
 fn main() {
@@ -16,24 +16,46 @@ fn main() {
     let k: u32 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(16);
     let min_count: u64 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(3);
     let cap: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(200);
-    let seeds_out: Option<String> = args.iter().position(|a| a == "--seeds")
-        .and_then(|i| args.get(i + 1)).cloned();
-    let w: u32 = args.iter().position(|a| a == "--w").and_then(|i| args.get(i + 1)).and_then(|s| s.parse().ok()).unwrap_or(1);
+    let seeds_out: Option<String> = args
+        .iter()
+        .position(|a| a == "--seeds")
+        .and_then(|i| args.get(i + 1))
+        .cloned();
+    let w: u32 = args
+        .iter()
+        .position(|a| a == "--w")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1);
 
     let t0 = std::time::Instant::now();
     let recs = read_fasta(fasta);
-    eprintln!("[io] {} records, {:.1} Mb ({:.1}s)",
-        recs.len(), recs.iter().map(|r| r.codes.len()).sum::<usize>() as f64 / 1e6, t0.elapsed().as_secs_f64());
+    eprintln!(
+        "[io] {} records, {:.1} Mb ({:.1}s)",
+        recs.len(),
+        recs.iter().map(|r| r.codes.len()).sum::<usize>() as f64 / 1e6,
+        t0.elapsed().as_secs_f64()
+    );
 
     let (seeds, st) = harvest(&recs, k, w, min_count, cap);
-    eprintln!("[harvest+sort] w={w} (1=exact, >1=minimizer), {:.1}s", t0.elapsed().as_secs_f64());
+    eprintln!(
+        "[harvest+sort] w={w} (1=exact, >1=minimizer), {:.1}s",
+        t0.elapsed().as_secs_f64()
+    );
 
     if let Some(p) = seeds_out {
         let mut w = BufWriter::new(File::create(&p).unwrap());
         for s in &seeds {
             write!(w, "{}\t{}", decode(s.code, k), s.count).unwrap();
             for &(ri, off, strand) in &s.occ {
-                write!(w, "\t{}:{}:{}", recs[ri as usize].name, off, if strand { '+' } else { '-' }).unwrap();
+                write!(
+                    w,
+                    "\t{}:{}:{}",
+                    recs[ri as usize].name,
+                    off,
+                    if strand { '+' } else { '-' }
+                )
+                .unwrap();
             }
             writeln!(w).unwrap();
         }
